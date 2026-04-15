@@ -13,17 +13,24 @@ if (document.documentElement.getAttribute(SUB2API_PANEL_LISTENER_SENTINEL) !== '
   document.documentElement.setAttribute(SUB2API_PANEL_LISTENER_SENTINEL, '1');
 
   chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
-    if (message.type === 'EXECUTE_STEP') {
+    if (message.type === 'EXECUTE_STEP' || message.type === 'REQUEST_OAUTH_URL') {
       resetStopState();
-      handleStep(message.step, message.payload).then(() => {
-        sendResponse({ ok: true });
+      const handler = message.type === 'REQUEST_OAUTH_URL'
+        ? requestOAuthUrl(message.payload)
+        : handleStep(message.step, message.payload);
+      handler.then((result) => {
+        sendResponse({ ok: true, ...(result || {}) });
       }).catch((err) => {
         if (isStopError(err)) {
-          log(`步骤 ${message.step}：已被用户停止。`, 'warn');
+          if (message.step) {
+            log(`步骤 ${message.step}：已被用户停止。`, 'warn');
+          }
           sendResponse({ stopped: true, error: err.message });
           return;
         }
-        reportError(message.step, err.message);
+        if (message.step) {
+          reportError(message.step, err.message);
+        }
         sendResponse({ error: err.message });
       });
       return true;
@@ -64,6 +71,10 @@ async function handleStep(step, payload = {}) {
     default:
       throw new Error(`sub2api-panel.js 不处理步骤 ${step}`);
   }
+}
+
+async function requestOAuthUrl(payload = {}) {
+  return step1_generateOpenAiAuthUrl(payload, { report: false });
 }
 
 async function requestJson(origin, path, options = {}) {
@@ -287,7 +298,9 @@ function openAccountsPageSoon(origin) {
   }, 500);
 }
 
-async function step1_generateOpenAiAuthUrl(payload = {}) {
+async function step1_generateOpenAiAuthUrl(payload = {}, options = {}) {
+  const { report = true } = options;
+  const logStep = Number.isInteger(payload?.logStep) ? payload.logStep : 1;
   const redirectUri = normalizeRedirectUri();
   const groupName = (payload.sub2apiGroupName || SUB2API_DEFAULT_GROUP_NAME).trim() || SUB2API_DEFAULT_GROUP_NAME;
 
@@ -295,8 +308,8 @@ async function step1_generateOpenAiAuthUrl(payload = {}) {
   const group = await getGroupByName(origin, token, groupName);
   const draftName = buildDraftAccountName(group.name || groupName);
 
-  log(`步骤 1：已登录 SUB2API，使用分组 ${group.name}（#${group.id}）。`);
-  log(`步骤 1：正在向 SUB2API 生成 OpenAI Auth 链接，回调地址为 ${redirectUri}。`);
+  log(`步骤 ${logStep}：已登录 SUB2API，使用分组 ${group.name}（#${group.id}）。`);
+  log(`步骤 ${logStep}：正在向 SUB2API 生成 OpenAI Auth 链接，回调地址为 ${redirectUri}。`);
 
   const authData = await requestJson(origin, '/api/v1/admin/openai/generate-auth-url', {
     method: 'POST',
@@ -314,15 +327,19 @@ async function step1_generateOpenAiAuthUrl(payload = {}) {
     throw new Error('SUB2API 未返回完整的 auth_url / session_id。');
   }
 
-  log(`步骤 1：已获取 SUB2API OAuth 链接：${oauthUrl.slice(0, 96)}...`, 'ok');
-  reportComplete(1, {
+  log(`步骤 ${logStep}：已获取 SUB2API OAuth 链接：${oauthUrl.slice(0, 96)}...`, 'ok');
+  const result = {
     oauthUrl,
     sub2apiSessionId: sessionId,
     sub2apiOAuthState: oauthState,
     sub2apiGroupId: group.id,
     sub2apiDraftName: draftName,
-  });
+  };
+  if (report) {
+    reportComplete(1, result);
+  }
   openAccountsPageSoon(origin);
+  return result;
 }
 
 async function step9_submitOpenAiCallback(payload = {}) {

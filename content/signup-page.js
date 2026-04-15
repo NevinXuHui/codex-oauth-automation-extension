@@ -1,48 +1,63 @@
-// content/signup-page.js — Content script for OpenAI auth pages (steps 2, 3, 4-receive, 5)
+// content/signup-page.js — Content script for ChatGPT signup entry + OpenAI auth pages
 // Injected on: auth0.openai.com, auth.openai.com, accounts.openai.com
+// Dynamically injected on: chatgpt.com
 
 console.log('[MultiPage:signup-page] Content script loaded on', location.href);
 
-// Listen for commands from Background
-chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
-  if (
-    message.type === 'EXECUTE_STEP'
-    || message.type === 'FILL_CODE'
-    || message.type === 'STEP8_FIND_AND_CLICK'
-    || message.type === 'STEP8_GET_STATE'
-    || message.type === 'STEP8_TRIGGER_CONTINUE'
-    || message.type === 'GET_LOGIN_AUTH_STATE'
-    || message.type === 'PREPARE_SIGNUP_VERIFICATION'
-    || message.type === 'RESEND_VERIFICATION_CODE'
-  ) {
-    resetStopState();
-    handleCommand(message).then((result) => {
-      sendResponse({ ok: true, ...(result || {}) });
-    }).catch(err => {
-      if (isStopError(err)) {
-        log(`步骤 ${message.step || 8}：已被用户停止。`, 'warn');
-        sendResponse({ stopped: true, error: err.message });
-        return;
-      }
+const SIGNUP_PAGE_LISTENER_SENTINEL = 'data-multipage-signup-page-listener';
 
-      if (message.type === 'STEP8_FIND_AND_CLICK') {
-        log(`步骤 8：${err.message}`, 'error');
+if (document.documentElement.getAttribute(SIGNUP_PAGE_LISTENER_SENTINEL) !== '1') {
+  document.documentElement.setAttribute(SIGNUP_PAGE_LISTENER_SENTINEL, '1');
+
+  // Listen for commands from Background
+  chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
+    if (
+      message.type === 'EXECUTE_STEP'
+      || message.type === 'FILL_CODE'
+      || message.type === 'STEP8_FIND_AND_CLICK'
+      || message.type === 'STEP8_GET_STATE'
+      || message.type === 'STEP8_TRIGGER_CONTINUE'
+      || message.type === 'GET_LOGIN_AUTH_STATE'
+      || message.type === 'PREPARE_SIGNUP_VERIFICATION'
+      || message.type === 'RESEND_VERIFICATION_CODE'
+      || message.type === 'ENSURE_SIGNUP_ENTRY_READY'
+      || message.type === 'ENSURE_SIGNUP_PASSWORD_PAGE_READY'
+    ) {
+      resetStopState();
+      handleCommand(message).then((result) => {
+        sendResponse({ ok: true, ...(result || {}) });
+      }).catch(err => {
+        if (isStopError(err)) {
+          if (message.step) {
+            log(`步骤 ${message.step || 8}：已被用户停止。`, 'warn');
+          }
+          sendResponse({ stopped: true, error: err.message });
+          return;
+        }
+
+        if (message.type === 'STEP8_FIND_AND_CLICK') {
+          log(`步骤 8：${err.message}`, 'error');
+          sendResponse({ error: err.message });
+          return;
+        }
+
+        if (message.step) {
+          reportError(message.step, err.message);
+        }
         sendResponse({ error: err.message });
-        return;
-      }
-
-      reportError(message.step, err.message);
-      sendResponse({ error: err.message });
-    });
-    return true;
-  }
-});
+      });
+      return true;
+    }
+  });
+} else {
+  console.log('[MultiPage:signup-page] 消息监听已存在，跳过重复注册');
+}
 
 async function handleCommand(message) {
   switch (message.type) {
     case 'EXECUTE_STEP':
       switch (message.step) {
-        case 2: return await step2_clickRegister();
+        case 2: return await step2_clickRegister(message.payload);
         case 3: return await step3_fillEmailPassword(message.payload);
         case 5: return await step5_fillNameBirthday(message.payload);
         case 6: return await step6_login(message.payload);
@@ -58,6 +73,10 @@ async function handleCommand(message) {
       return await prepareSignupVerificationFlow(message.payload);
     case 'RESEND_VERIFICATION_CODE':
       return await resendVerificationCode(message.step);
+    case 'ENSURE_SIGNUP_ENTRY_READY':
+      return await ensureSignupEntryReady();
+    case 'ENSURE_SIGNUP_PASSWORD_PAGE_READY':
+      return await ensureSignupPasswordPageReady();
     case 'STEP8_FIND_AND_CLICK':
       return await step8_findAndClick();
     case 'STEP8_GET_STATE':
@@ -212,91 +231,252 @@ async function resendVerificationCode(step, timeout = 45000) {
 }
 
 // ============================================================
-// Step 2: Click Register
+// Signup Entry Helpers
 // ============================================================
 
-async function step2_clickRegister() {
-  log('步骤 2：正在查找注册按钮...');
+const SIGNUP_ENTRY_TRIGGER_PATTERN = /免费注册|立即注册|注册|sign\s*up|register|create\s*account|create\s+account/i;
+const SIGNUP_EMAIL_INPUT_SELECTOR = 'input[type="email"], input[name="email"], input[name="username"], input[id*="email"], input[placeholder*="email" i]';
 
-  let registerBtn = null;
-  try {
-    registerBtn = await waitForElementByText(
-      'a, button, [role="button"], [role="link"]',
-      /sign\s*up|register|create\s*account|注册/i,
-      10000
-    );
-  } catch {
-    // Some pages may have a direct link
-    try {
-      registerBtn = await waitForElement('a[href*="signup"], a[href*="register"]', 5000);
-    } catch {
-      throw new Error(
-        '未找到注册按钮。' +
-        '请在 DevTools 中检查认证页面 DOM。URL: ' + location.href
-      );
-    }
+function getSignupEmailInput() {
+  const input = document.querySelector(SIGNUP_EMAIL_INPUT_SELECTOR);
+  return input && isVisibleElement(input) ? input : null;
+}
+
+function getSignupEmailContinueButton({ allowDisabled = false } = {}) {
+  const direct = document.querySelector('button[type="submit"], input[type="submit"]');
+  if (direct && isVisibleElement(direct) && (allowDisabled || isActionEnabled(direct))) {
+    return direct;
   }
 
-  await humanPause(450, 1200);
-  reportComplete(2);
-  simulateClick(registerBtn);
-  log('步骤 2：已点击注册按钮');
+  const candidates = document.querySelectorAll(
+    'button, a, [role="button"], [role="link"], input[type="button"], input[type="submit"]'
+  );
+  return Array.from(candidates).find((el) => {
+    if (!isVisibleElement(el) || (!allowDisabled && !isActionEnabled(el))) return false;
+    return /continue|next|submit|继续|下一步/i.test(getActionText(el));
+  }) || null;
+}
+
+function findSignupEntryTrigger() {
+  const candidates = document.querySelectorAll('a, button, [role="button"], [role="link"]');
+  return Array.from(candidates).find((el) => {
+    if (!isVisibleElement(el) || !isActionEnabled(el)) return false;
+    return SIGNUP_ENTRY_TRIGGER_PATTERN.test(getActionText(el));
+  }) || null;
+}
+
+function getSignupPasswordDisplayedEmail() {
+  const text = (document.body?.innerText || document.body?.textContent || '')
+    .replace(/\s+/g, ' ')
+    .trim();
+  const matches = text.match(/[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/ig);
+  return matches?.[0] ? String(matches[0]).trim().toLowerCase() : '';
+}
+
+function inspectSignupEntryState() {
+  const passwordInput = getSignupPasswordInput();
+  if (isSignupPasswordPage() && passwordInput) {
+    return {
+      state: 'password_page',
+      passwordInput,
+      submitButton: getSignupPasswordSubmitButton({ allowDisabled: true }),
+      displayedEmail: getSignupPasswordDisplayedEmail(),
+      url: location.href,
+    };
+  }
+
+  const emailInput = getSignupEmailInput();
+  if (emailInput) {
+    return {
+      state: 'email_entry',
+      emailInput,
+      continueButton: getSignupEmailContinueButton({ allowDisabled: true }),
+      url: location.href,
+    };
+  }
+
+  const signupTrigger = findSignupEntryTrigger();
+  if (signupTrigger) {
+    return {
+      state: 'entry_home',
+      signupTrigger,
+      url: location.href,
+    };
+  }
+
+  return {
+    state: 'unknown',
+    url: location.href,
+  };
+}
+
+async function waitForSignupEntryState(options = {}) {
+  const {
+    timeout = 15000,
+    autoOpenEntry = false,
+  } = options;
+  const start = Date.now();
+  let lastTriggerClickAt = 0;
+
+  while (Date.now() - start < timeout) {
+    throwIfStopped();
+    const snapshot = inspectSignupEntryState();
+
+    if (snapshot.state === 'password_page' || snapshot.state === 'email_entry') {
+      return snapshot;
+    }
+
+    if (snapshot.state === 'entry_home') {
+      if (!autoOpenEntry) {
+        return snapshot;
+      }
+
+      if (Date.now() - lastTriggerClickAt >= 1500) {
+        lastTriggerClickAt = Date.now();
+        log('步骤 2：正在点击官网注册入口...');
+        await humanPause(350, 900);
+        simulateClick(snapshot.signupTrigger);
+      }
+    }
+
+    await sleep(250);
+  }
+
+  return inspectSignupEntryState();
+}
+
+async function ensureSignupEntryReady(timeout = 15000) {
+  const snapshot = await waitForSignupEntryState({ timeout, autoOpenEntry: false });
+  if (snapshot.state === 'entry_home' || snapshot.state === 'email_entry' || snapshot.state === 'password_page') {
+    return {
+      ready: true,
+      state: snapshot.state,
+      url: snapshot.url || location.href,
+    };
+  }
+
+  throw new Error('当前页面没有可用的注册入口，也不在邮箱/密码页。URL: ' + location.href);
+}
+
+async function ensureSignupPasswordPageReady(timeout = 20000) {
+  const start = Date.now();
+
+  while (Date.now() - start < timeout) {
+    throwIfStopped();
+    const passwordInput = getSignupPasswordInput();
+    if (isSignupPasswordPage() && passwordInput) {
+      return {
+        ready: true,
+        state: 'password_page',
+        url: location.href,
+      };
+    }
+    await sleep(200);
+  }
+
+  throw new Error('等待进入密码页超时。URL: ' + location.href);
+}
+
+async function fillSignupEmailAndContinue(email, step) {
+  if (!email) throw new Error(`未提供邮箱地址，步骤 ${step} 无法继续。`);
+  const normalizedEmail = String(email || '').trim().toLowerCase();
+
+  const snapshot = await waitForSignupEntryState({
+    timeout: 20000,
+    autoOpenEntry: true,
+  });
+
+  if (snapshot.state === 'password_page') {
+    if (snapshot.displayedEmail && snapshot.displayedEmail !== normalizedEmail) {
+      throw new Error(`步骤 ${step}：当前密码页邮箱为 ${snapshot.displayedEmail}，与目标邮箱 ${email} 不一致，请先回到步骤 1 重新开始。`);
+    }
+    log(`步骤 ${step}：当前已在密码页，无需重复提交邮箱。`);
+    return {
+      alreadyOnPasswordPage: true,
+      url: snapshot.url || location.href,
+    };
+  }
+
+  if (snapshot.state !== 'email_entry' || !snapshot.emailInput) {
+    throw new Error(`步骤 ${step}：未找到可用的邮箱输入入口。URL: ${location.href}`);
+  }
+
+  log(`步骤 ${step}：正在填写邮箱：${email}`);
+  await humanPause(500, 1400);
+  fillInput(snapshot.emailInput, email);
+  log(`步骤 ${step}：邮箱已填写`);
+
+  const continueButton = snapshot.continueButton || getSignupEmailContinueButton({ allowDisabled: true });
+  if (!continueButton || !isActionEnabled(continueButton)) {
+    throw new Error(`步骤 ${step}：未找到可点击的“继续”按钮。URL: ${location.href}`);
+  }
+
+  log(`步骤 ${step}：邮箱已准备提交，正在前往密码页...`);
+  window.setTimeout(() => {
+    try {
+      simulateClick(continueButton);
+    } catch (error) {
+      console.error('[MultiPage:signup-page] deferred signup email submit failed:', error?.message || error);
+    }
+  }, 120);
+
+  return {
+    submitted: true,
+    email,
+    url: location.href,
+  };
 }
 
 // ============================================================
-// Step 3: Fill Email & Password
+// Step 2: Click Register, fill email, then continue to password page
+// ============================================================
+
+async function step2_clickRegister(payload = {}) {
+  const { email } = payload;
+  return fillSignupEmailAndContinue(email, 2);
+}
+
+// ============================================================
+// Step 3: Fill Password
 // ============================================================
 
 async function step3_fillEmailPassword(payload) {
-  const { email } = payload;
-  if (!email) throw new Error('未提供邮箱地址，请先在侧边栏粘贴邮箱。');
+  const { email, password } = payload;
+  if (!password) throw new Error('未提供密码，步骤 3 需要可用密码。');
+  const normalizedEmail = String(email || '').trim().toLowerCase();
 
-  log(`步骤 3：正在填写邮箱：${email}`);
-
-  // Find email input
-  let emailInput = null;
-  try {
-    emailInput = await waitForElement(
-      'input[type="email"], input[name="email"], input[name="username"], input[id*="email"], input[placeholder*="email"], input[placeholder*="Email"]',
-      10000
-    );
-  } catch {
-    throw new Error('在注册页未找到邮箱输入框。URL: ' + location.href);
+  let snapshot = inspectSignupEntryState();
+  if (snapshot.state === 'entry_home') {
+    throw new Error('当前仍停留在 ChatGPT 官网首页，请先完成步骤 2。');
   }
 
-  await humanPause(500, 1400);
-  fillInput(emailInput, email);
-  log('步骤 3：邮箱已填写');
-
-  // Check if password field is on the same page
-  let passwordInput = document.querySelector('input[type="password"]');
-
-  if (!passwordInput) {
-    // Need to submit email first to get to password page
-    log('步骤 3：暂未发现密码输入框，先提交邮箱...');
-    const submitBtn = document.querySelector('button[type="submit"]')
-      || await waitForElementByText('button', /continue|next|submit|继续|下一步/i, 5000).catch(() => null);
-
-    if (submitBtn) {
-      await humanPause(400, 1100);
-      simulateClick(submitBtn);
-      log('步骤 3：邮箱已提交，正在等待密码输入框...');
-      await sleep(2000);
+  if (snapshot.state === 'email_entry') {
+    const transition = await fillSignupEmailAndContinue(email, 3);
+    if (!transition.alreadyOnPasswordPage) {
+      await sleep(1200);
+      await ensureSignupPasswordPageReady();
     }
-
-    try {
-      passwordInput = await waitForElement('input[type="password"]', 10000);
-    } catch {
-      throw new Error('提交邮箱后仍未找到密码输入框。URL: ' + location.href);
-    }
+    snapshot = inspectSignupEntryState();
   }
 
-  if (!payload.password) throw new Error('未提供密码，步骤 3 需要可用密码。');
+  if (snapshot.state !== 'password_page' || !snapshot.passwordInput) {
+    await ensureSignupPasswordPageReady();
+    snapshot = inspectSignupEntryState();
+  }
+
+  if (snapshot.state !== 'password_page' || !snapshot.passwordInput) {
+    throw new Error('在密码页未找到密码输入框。URL: ' + location.href);
+  }
+  if (normalizedEmail && snapshot.displayedEmail && snapshot.displayedEmail !== normalizedEmail) {
+    throw new Error(`当前密码页邮箱为 ${snapshot.displayedEmail}，与目标邮箱 ${email} 不一致，请先回到步骤 1 重新开始。`);
+  }
+
   await humanPause(600, 1500);
-  fillInput(passwordInput, payload.password);
+  fillInput(snapshot.passwordInput, password);
   log('步骤 3：密码已填写');
 
-  const submitBtn = document.querySelector('button[type="submit"]')
+  const submitBtn = snapshot.submitButton
+    || getSignupPasswordSubmitButton({ allowDisabled: true })
     || await waitForElementByText('button', /continue|sign\s*up|submit|注册|创建|create/i, 5000).catch(() => null);
 
   // Report complete BEFORE submit, because submit causes page navigation

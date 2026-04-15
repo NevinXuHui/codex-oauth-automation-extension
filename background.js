@@ -3160,6 +3160,13 @@ function isSignupPageHost(hostname = '') {
   return ['auth0.openai.com', 'auth.openai.com', 'accounts.openai.com'].includes(hostname);
 }
 
+function isSignupPasswordPageUrl(rawUrl) {
+  const parsed = parseUrlSafely(rawUrl);
+  if (!parsed) return false;
+  return isSignupPageHost(parsed.hostname)
+    && /\/create-account\/password(?:[/?#]|$)/i.test(parsed.pathname || '');
+}
+
 function is163MailHost(hostname = '') {
   return hostname === 'mail.163.com'
     || hostname.endsWith('.mail.163.com')
@@ -3369,6 +3376,26 @@ async function waitForTabUrlFamily(source, tabId, referenceUrl, options = {}) {
     try {
       const tab = await chrome.tabs.get(tabId);
       if (matchesSourceUrlFamily(source, tab.url, referenceUrl)) {
+        return tab;
+      }
+    } catch {
+      return null;
+    }
+
+    await new Promise((resolve) => setTimeout(resolve, retryDelayMs));
+  }
+
+  return null;
+}
+
+async function waitForTabUrlMatch(tabId, matcher, options = {}) {
+  const { timeoutMs = 15000, retryDelayMs = 400 } = options;
+  const start = Date.now();
+
+  while (Date.now() - start < timeoutMs) {
+    try {
+      const tab = await chrome.tabs.get(tabId);
+      if (matcher(tab.url || '', tab)) {
         return tab;
       }
     } catch {
@@ -5118,8 +5145,8 @@ async function handleStepData(step, payload) {
 const stepWaiters = new Map();
 let resumeWaiter = null;
 const AUTO_RUN_SIGNAL_COMPLETION_TIMEOUT_MS = 120000;
-const AUTO_RUN_BACKGROUND_COMPLETED_STEPS = new Set([4, 6, 7, 8]);
-const STEP_COMPLETION_SIGNAL_STEPS = new Set([1, 2, 3, 5, 9]);
+const AUTO_RUN_BACKGROUND_COMPLETED_STEPS = new Set([1, 2, 4, 6, 7, 8]);
+const STEP_COMPLETION_SIGNAL_STEPS = new Set([3, 5, 9]);
 
 function waitForStepComplete(step, timeoutMs = 120000) {
   return new Promise((resolve, reject) => {
@@ -5755,19 +5782,20 @@ async function runAutoSequenceFromStep(startStep, context = {}) {
   if (continued) {
     await addLog(`=== 目标 ${targetRun}/${totalRuns} 轮：继续当前进度，从步骤 ${startStep} 开始（第 ${attemptRuns} 次尝试）===`, 'info');
   } else {
-    await addLog(`=== 目标 ${targetRun}/${totalRuns} 轮：第 ${attemptRuns} 次尝试，阶段 1，获取 OAuth 链接并打开注册页 ===`, 'info');
+    await addLog(`=== 目标 ${targetRun}/${totalRuns} 轮：第 ${attemptRuns} 次尝试，阶段 1，打开官网并进入密码页 ===`, 'info');
+  }
+
+  if (startStep <= 1) {
+    await executeStepAndWait(1, AUTO_STEP_DELAYS[1]);
   }
 
   if (startStep <= 2) {
-    for (const step of [1, 2]) {
-      if (step < startStep) continue;
-      await executeStepAndWait(step, AUTO_STEP_DELAYS[step]);
-    }
+    await ensureAutoEmailReady(targetRun, totalRuns, attemptRuns);
+    await executeStepAndWait(2, AUTO_STEP_DELAYS[2]);
   }
 
   if (startStep <= 3) {
-    await ensureAutoEmailReady(targetRun, totalRuns, attemptRuns);
-    await addLog(`=== 目标 ${targetRun}/${totalRuns} 轮：阶段 2，注册、验证、登录并完成授权（第 ${attemptRuns} 次尝试）===`, 'info');
+    await addLog(`=== 目标 ${targetRun}/${totalRuns} 轮：阶段 2，填写密码、验证、登录并完成授权（第 ${attemptRuns} 次尝试）===`, 'info');
     await broadcastAutoRunStatus('running', {
       currentRun: targetRun,
       totalRuns,
@@ -6416,63 +6444,71 @@ async function resumeAutoRun() {
 }
 
 // ============================================================
-// Step 1: Get OAuth Link
+// Signup / OAuth Helpers
 // ============================================================
 
-async function executeStep1(state) {
+const SIGNUP_ENTRY_URL = 'https://chatgpt.com/';
+const SIGNUP_PAGE_INJECT_FILES = ['content/utils.js', 'content/signup-page.js'];
+
+async function requestOAuthUrlFromPanel(state, options = {}) {
   if (getPanelMode(state) === 'sub2api') {
-    return executeSub2ApiStep1(state);
+    return requestSub2ApiOAuthUrl(state, options);
   }
-  return executeCpaStep1(state);
+  return requestCpaOAuthUrl(state, options);
 }
 
-async function executeCpaStep1(state) {
+async function requestCpaOAuthUrl(state, options = {}) {
+  const { logLabel = 'OAuth 刷新' } = options;
   if (!state.vpsUrl) {
     throw new Error('尚未配置 CPA 地址，请先在侧边栏填写。');
   }
-  await addLog('步骤 1：正在打开 CPA 面板...');
+
+  await addLog(`${logLabel}：正在打开 CPA 面板...`);
 
   const injectFiles = ['content/activation-utils.js', 'content/utils.js', 'content/vps-panel.js'];
-
   await closeConflictingTabsForSource('vps-panel', state.vpsUrl);
 
   const tab = await chrome.tabs.create({ url: state.vpsUrl, active: true });
   const tabId = tab.id;
   await rememberSourceLastUrl('vps-panel', state.vpsUrl);
 
-  await addLog('步骤 1：CPA 面板已打开，正在等待页面进入目标地址...');
+  await addLog(`${logLabel}：CPA 面板已打开，正在等待页面进入目标地址...`);
   const matchedTab = await waitForTabUrlFamily('vps-panel', tabId, state.vpsUrl, {
     timeoutMs: 15000,
     retryDelayMs: 400,
   });
   if (!matchedTab) {
-    await addLog('步骤 1：CPA 页面尚未完全进入目标地址，继续尝试连接内容脚本...', 'warn');
+    await addLog(`${logLabel}：CPA 页面尚未完全进入目标地址，继续尝试连接内容脚本...`, 'warn');
   }
 
   await ensureContentScriptReadyOnTab('vps-panel', tabId, {
     inject: injectFiles,
     timeoutMs: 45000,
     retryDelayMs: 900,
-    logMessage: '步骤 1：CPA 面板仍在加载，正在重试连接内容脚本...',
+    logMessage: `${logLabel}：CPA 面板仍在加载，正在重试连接内容脚本...`,
   });
 
   const result = await sendToContentScriptResilient('vps-panel', {
-    type: 'EXECUTE_STEP',
-    step: 1,
+    type: 'REQUEST_OAUTH_URL',
     source: 'background',
-    payload: { vpsPassword: state.vpsPassword },
+    payload: {
+      vpsPassword: state.vpsPassword,
+      logStep: 6,
+    },
   }, {
     timeoutMs: 30000,
     retryDelayMs: 700,
-    logMessage: '步骤 1：CPA 面板通信未就绪，正在等待页面恢复...',
+    logMessage: `${logLabel}：CPA 面板通信未就绪，正在等待页面恢复...`,
   });
 
   if (result?.error) {
     throw new Error(result.error);
   }
+  return result || {};
 }
 
-async function executeSub2ApiStep1(state) {
+async function requestSub2ApiOAuthUrl(state, options = {}) {
+  const { logLabel = 'OAuth 刷新' } = options;
   const sub2apiUrl = normalizeSub2ApiUrl(state.sub2apiUrl);
   const groupName = (state.sub2apiGroupName || DEFAULT_SUB2API_GROUP_NAME).trim() || DEFAULT_SUB2API_GROUP_NAME;
 
@@ -6483,23 +6519,22 @@ async function executeSub2ApiStep1(state) {
     throw new Error('尚未配置 SUB2API 登录密码，请先在侧边栏填写。');
   }
 
-  await addLog('步骤 1：正在打开 SUB2API 后台...');
+  await addLog(`${logLabel}：正在打开 SUB2API 后台...`);
 
   const injectFiles = ['content/utils.js', 'content/sub2api-panel.js'];
-
   await closeConflictingTabsForSource('sub2api-panel', sub2apiUrl);
 
   const tab = await chrome.tabs.create({ url: sub2apiUrl, active: true });
   const tabId = tab.id;
   await rememberSourceLastUrl('sub2api-panel', sub2apiUrl);
 
-  await addLog('步骤 1：SUB2API 页面已打开，正在等待页面进入目标地址...');
+  await addLog(`${logLabel}：SUB2API 页面已打开，正在等待页面进入目标地址...`);
   const matchedTab = await waitForTabUrlFamily('sub2api-panel', tabId, sub2apiUrl, {
     timeoutMs: 15000,
     retryDelayMs: 400,
   });
   if (!matchedTab) {
-    await addLog('步骤 1：SUB2API 页面尚未稳定，继续尝试连接内容脚本...', 'warn');
+    await addLog(`${logLabel}：SUB2API 页面尚未稳定，继续尝试连接内容脚本...`, 'warn');
   }
 
   await ensureContentScriptReadyOnTab('sub2api-panel', tabId, {
@@ -6507,18 +6542,18 @@ async function executeSub2ApiStep1(state) {
     injectSource: 'sub2api-panel',
     timeoutMs: 45000,
     retryDelayMs: 900,
-    logMessage: '步骤 1：SUB2API 页面仍在加载，正在重试连接内容脚本...',
+    logMessage: `${logLabel}：SUB2API 页面仍在加载，正在重试连接内容脚本...`,
   });
 
   const result = await sendToContentScript('sub2api-panel', {
-    type: 'EXECUTE_STEP',
-    step: 1,
+    type: 'REQUEST_OAUTH_URL',
     source: 'background',
     payload: {
       sub2apiUrl,
       sub2apiEmail: state.sub2apiEmail,
       sub2apiPassword: state.sub2apiPassword,
       sub2apiGroupName: groupName,
+      logStep: 6,
     },
   }, {
     responseTimeoutMs: SUB2API_STEP1_RESPONSE_TIMEOUT_MS,
@@ -6527,32 +6562,86 @@ async function executeSub2ApiStep1(state) {
   if (result?.error) {
     throw new Error(result.error);
   }
+  return result || {};
 }
 
-// ============================================================
-// Step 2: Open Signup Page (Background opens tab, signup-page.js clicks Register)
-// ============================================================
+async function openSignupEntryTab(step = 1) {
+  const tabId = await reuseOrCreateTab('signup-page', SIGNUP_ENTRY_URL, {
+    inject: SIGNUP_PAGE_INJECT_FILES,
+    injectSource: 'signup-page',
+  });
 
-async function executeStep2(state) {
-  if (!state.oauthUrl) {
-    throw new Error('缺少 OAuth 链接，请先完成步骤 1。');
-  }
-  await addLog('步骤 2：正在打开认证链接...');
-  await reuseOrCreateTab('signup-page', state.oauthUrl);
+  await ensureContentScriptReadyOnTab('signup-page', tabId, {
+    inject: SIGNUP_PAGE_INJECT_FILES,
+    injectSource: 'signup-page',
+    timeoutMs: 45000,
+    retryDelayMs: 900,
+    logMessage: `步骤 ${step}：ChatGPT 官网仍在加载，正在重试连接内容脚本...`,
+  });
 
-  await sendToContentScript('signup-page', {
-    type: 'EXECUTE_STEP',
-    step: 2,
+  return tabId;
+}
+
+async function ensureSignupEntryPageReady(step = 1) {
+  const tabId = await openSignupEntryTab(step);
+  const result = await sendToContentScriptResilient('signup-page', {
+    type: 'ENSURE_SIGNUP_ENTRY_READY',
+    step,
     source: 'background',
     payload: {},
+  }, {
+    timeoutMs: 20000,
+    retryDelayMs: 700,
+    logMessage: `步骤 ${step}：官网注册入口正在切换，等待页面恢复...`,
   });
+
+  if (result?.error) {
+    throw new Error(result.error);
+  }
+
+  return { tabId, result: result || {} };
 }
 
-// ============================================================
-// Step 3: Fill Email & Password (via signup-page.js)
-// ============================================================
+async function ensureSignupPasswordPageReadyInTab(tabId, step = 2, options = {}) {
+  const { skipUrlWait = false } = options;
 
-async function executeStep3(state) {
+  if (!skipUrlWait) {
+    const matchedTab = await waitForTabUrlMatch(tabId, (url) => isSignupPasswordPageUrl(url), {
+      timeoutMs: 45000,
+      retryDelayMs: 300,
+    });
+    if (!matchedTab) {
+      throw new Error('等待进入密码页超时，请检查邮箱提交后页面是否仍停留在官网或邮箱页。');
+    }
+  }
+
+  await ensureContentScriptReadyOnTab('signup-page', tabId, {
+    inject: SIGNUP_PAGE_INJECT_FILES,
+    injectSource: 'signup-page',
+    timeoutMs: 45000,
+    retryDelayMs: 900,
+    logMessage: `步骤 ${step}：密码页仍在加载，正在重试连接内容脚本...`,
+  });
+
+  const result = await sendToContentScriptResilient('signup-page', {
+    type: 'ENSURE_SIGNUP_PASSWORD_PAGE_READY',
+    step,
+    source: 'background',
+    payload: {},
+  }, {
+    timeoutMs: 20000,
+    retryDelayMs: 700,
+    logMessage: `步骤 ${step}：认证页正在切换，等待密码页重新就绪...`,
+  });
+
+  if (result?.error) {
+    throw new Error(result.error);
+  }
+
+  return result || {};
+}
+
+async function resolveSignupEmailForFlow(state) {
   let resolvedEmail = state.email;
   if (isHotmailProvider(state)) {
     const account = await ensureHotmailAccountForFlow({
@@ -6572,19 +6661,102 @@ async function executeStep3(state) {
     throw new Error('缺少邮箱地址，请先在侧边栏粘贴邮箱。');
   }
 
-  const password = state.customPassword || generatePassword();
+  return resolvedEmail;
+}
+
+// ============================================================
+// Step 1: Open ChatGPT homepage
+// ============================================================
+
+async function executeStep1() {
+  await addLog('步骤 1：正在打开 ChatGPT 官网...');
+  await ensureSignupEntryPageReady(1);
+  await completeStepFromBackground(1, {});
+}
+
+// ============================================================
+// Step 2: Click signup, fill email, continue to password page
+// ============================================================
+
+async function executeStep2(state) {
+  const resolvedEmail = await resolveSignupEmailForFlow(state);
   if (resolvedEmail !== state.email) {
     await setEmailState(resolvedEmail);
   }
+
+  let signupTabId = await getTabId('signup-page');
+  if (!signupTabId || !(await isTabAlive('signup-page'))) {
+    await addLog('步骤 2：未发现可用的注册页标签，正在重新打开 ChatGPT 官网...', 'warn');
+    signupTabId = (await ensureSignupEntryPageReady(2)).tabId;
+  } else {
+    await chrome.tabs.update(signupTabId, { active: true });
+    await ensureContentScriptReadyOnTab('signup-page', signupTabId, {
+      inject: SIGNUP_PAGE_INJECT_FILES,
+      injectSource: 'signup-page',
+      timeoutMs: 45000,
+      retryDelayMs: 900,
+      logMessage: '步骤 2：注册入口页内容脚本未就绪，正在等待页面恢复...',
+    });
+  }
+
+  const step2Result = await sendToContentScriptResilient('signup-page', {
+    type: 'EXECUTE_STEP',
+    step: 2,
+    source: 'background',
+    payload: { email: resolvedEmail },
+  }, {
+    timeoutMs: 20000,
+    retryDelayMs: 700,
+    logMessage: '步骤 2：官网注册入口正在切换，等待页面恢复后继续输入邮箱...',
+  });
+
+  if (step2Result?.error) {
+    throw new Error(step2Result.error);
+  }
+
+  if (!step2Result?.alreadyOnPasswordPage) {
+    await addLog(`步骤 2：邮箱 ${resolvedEmail} 已提交，正在等待进入密码页...`);
+  }
+
+  await ensureSignupPasswordPageReadyInTab(signupTabId, 2, {
+    skipUrlWait: Boolean(step2Result?.alreadyOnPasswordPage),
+  });
+  await completeStepFromBackground(2, {});
+}
+
+// ============================================================
+// Step 3: Fill Password (via signup-page.js)
+// ============================================================
+
+async function executeStep3(state) {
+  const resolvedEmail = state.email;
+  if (!resolvedEmail) {
+    throw new Error('缺少邮箱地址，请先完成步骤 2。');
+  }
+
+  const signupTabId = await getTabId('signup-page');
+  if (!signupTabId || !(await isTabAlive('signup-page'))) {
+    throw new Error('认证页面标签页已关闭，请先重新完成步骤 2。');
+  }
+
+  const password = state.customPassword || generatePassword();
   await setPasswordState(password);
 
-  // Save account record
   const accounts = state.accounts || [];
   accounts.push({ email: resolvedEmail, password, createdAt: new Date().toISOString() });
   await setState({ accounts });
 
+  await chrome.tabs.update(signupTabId, { active: true });
+  await ensureContentScriptReadyOnTab('signup-page', signupTabId, {
+    inject: SIGNUP_PAGE_INJECT_FILES,
+    injectSource: 'signup-page',
+    timeoutMs: 45000,
+    retryDelayMs: 900,
+    logMessage: '步骤 3：密码页内容脚本未就绪，正在等待页面恢复...',
+  });
+
   await addLog(
-    `步骤 3：正在填写邮箱 ${resolvedEmail}，密码为${state.customPassword ? '自定义' : '自动生成'}（${password.length} 位）`
+    `步骤 3：正在填写密码，邮箱为 ${resolvedEmail}，密码为${state.customPassword ? '自定义' : '自动生成'}（${password.length} 位）`
   );
   await sendToContentScript('signup-page', {
     type: 'EXECUTE_STEP',
@@ -7218,20 +7390,15 @@ async function executeStep5(state) {
 
 async function refreshOAuthUrlBeforeStep6(state) {
   await addLog(`步骤 6：正在刷新登录用的 ${getPanelModeLabel(state)} OAuth 链接...`);
-  console.log(LOG_PREFIX, '[refreshOAuthUrlBeforeStep6] preparing fresh OAuth via step 1');
-  const waitForFreshOAuth = waitForStepComplete(1, 120000);
-  console.log(LOG_PREFIX, '[refreshOAuthUrlBeforeStep6] executing step 1 for fresh OAuth');
-  await executeStep1(state);
-  console.log(LOG_PREFIX, '[refreshOAuthUrlBeforeStep6] step 1 execute returned, waiting for completion signal');
-  await waitForFreshOAuth;
-  console.log(LOG_PREFIX, '[refreshOAuthUrlBeforeStep6] step 1 completion signal received');
+  console.log(LOG_PREFIX, '[refreshOAuthUrlBeforeStep6] requesting fresh OAuth directly from panel');
+  const refreshResult = await requestOAuthUrlFromPanel(state, { logLabel: '步骤 6' });
+  await handleStepData(1, refreshResult);
 
-  const latestState = await getState();
-  if (!latestState.oauthUrl) {
+  if (!refreshResult?.oauthUrl) {
     throw new Error('刷新 OAuth 链接后仍未拿到可用链接。');
   }
 
-  return latestState.oauthUrl;
+  return refreshResult.oauthUrl;
 }
 
 function isStep6SuccessResult(result) {
@@ -7368,7 +7535,7 @@ async function runStep7Attempt(state) {
     await chrome.tabs.update(authTabId, { active: true });
   } else {
     if (!state.oauthUrl) {
-      throw new Error('缺少 OAuth 链接，请先完成步骤 1。');
+      throw new Error('缺少登录用 OAuth 链接，请先完成步骤 6。');
     }
     await reuseOrCreateTab('signup-page', state.oauthUrl);
   }
@@ -7481,7 +7648,6 @@ const STEP8_CLICK_EFFECT_TIMEOUT_MS = 15000;
 const STEP8_CLICK_RETRY_DELAY_MS = 500;
 const STEP8_READY_WAIT_TIMEOUT_MS = 30000;
 const STEP8_MAX_ROUNDS = 5;
-const STEP8_SIGNUP_PAGE_INJECT_FILES = ['content/utils.js', 'content/signup-page.js'];
 const STEP8_STRATEGIES = [
   { mode: 'content', strategy: 'requestSubmit', label: 'form.requestSubmit' },
   { mode: 'debugger', label: 'debugger click' },
@@ -7520,7 +7686,7 @@ function throwIfStep8SettledOrStopped(isSettled = false) {
 
 async function ensureStep8SignupPageReady(tabId, options = {}) {
   await ensureContentScriptReadyOnTab('signup-page', tabId, {
-    inject: STEP8_SIGNUP_PAGE_INJECT_FILES,
+    inject: SIGNUP_PAGE_INJECT_FILES,
     injectSource: 'signup-page',
     timeoutMs: options.timeoutMs ?? 15000,
     retryDelayMs: options.retryDelayMs ?? 600,
@@ -7720,7 +7886,7 @@ function getStep8EffectLabel(effect) {
 
 async function executeStep8(state) {
   if (!state.oauthUrl) {
-    throw new Error('缺少 OAuth 链接，请先完成步骤 1。');
+    throw new Error('缺少登录用 OAuth 链接，请先完成步骤 6。');
   }
 
   await addLog('步骤 8：正在监听 localhost 回调地址...');

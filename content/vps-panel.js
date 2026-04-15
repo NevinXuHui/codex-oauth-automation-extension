@@ -36,31 +36,41 @@ if (document.documentElement.getAttribute(VPS_PANEL_LISTENER_SENTINEL) !== '1') 
 
   // Listen for commands from Background
   chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
-    if (message.type === 'EXECUTE_STEP') {
+    if (message.type === 'EXECUTE_STEP' || message.type === 'REQUEST_OAUTH_URL') {
       resetStopState();
       const startedAt = Date.now();
-      console.log(LOG_PREFIX, `EXECUTE_STEP received for step ${message.step}`, {
+      const actionLabel = message.type === 'REQUEST_OAUTH_URL'
+        ? 'REQUEST_OAUTH_URL'
+        : `EXECUTE_STEP received for step ${message.step}`;
+      console.log(LOG_PREFIX, actionLabel, {
         url: location.href,
         payloadKeys: Object.keys(message.payload || {}),
         snapshot: getVpsPanelSnapshot(),
       });
-      handleStep(message.step, message.payload).then(() => {
-        console.log(LOG_PREFIX, `EXECUTE_STEP resolved for step ${message.step} after ${Date.now() - startedAt}ms`, {
+      const handler = message.type === 'REQUEST_OAUTH_URL'
+        ? requestOAuthUrl(message.payload)
+        : handleStep(message.step, message.payload);
+      handler.then((result) => {
+        console.log(LOG_PREFIX, `${actionLabel} resolved after ${Date.now() - startedAt}ms`, {
           url: location.href,
           snapshot: getVpsPanelSnapshot(),
         });
-        sendResponse({ ok: true });
+        sendResponse({ ok: true, ...(result || {}) });
       }).catch(err => {
-        console.error(LOG_PREFIX, `EXECUTE_STEP rejected for step ${message.step} after ${Date.now() - startedAt}ms: ${err?.message || err}`, {
+        console.error(LOG_PREFIX, `${actionLabel} rejected after ${Date.now() - startedAt}ms: ${err?.message || err}`, {
           url: location.href,
           snapshot: getVpsPanelSnapshot(),
         });
         if (isStopError(err)) {
-          log(`步骤 ${message.step}：已被用户停止。`, 'warn');
+          if (message.step) {
+            log(`步骤 ${message.step}：已被用户停止。`, 'warn');
+          }
           sendResponse({ stopped: true, error: err.message });
           return;
         }
-        reportError(message.step, err.message);
+        if (message.step) {
+          reportError(message.step, err.message);
+        }
         sendResponse({ error: err.message });
       });
       return true;
@@ -489,21 +499,27 @@ async function ensureOAuthManagementPage(vpsPassword, step = 1, timeout = 45000)
   throw new Error('无法进入 CPA 的 OAuth 管理页面，请检查面板是否正常加载。URL: ' + location.href);
 }
 
+async function requestOAuthUrl(payload = {}) {
+  return step1_getOAuthLink(payload, { report: false });
+}
+
 // ============================================================
 // Step 1: Get OAuth Link
 // ============================================================
 
-async function step1_getOAuthLink(payload) {
+async function step1_getOAuthLink(payload, options = {}) {
+  const { report = true } = options;
   const { vpsPassword } = payload || {};
+  const logStep = Number.isInteger(payload?.logStep) ? payload.logStep : 1;
   console.log(LOG_PREFIX, '[Step 1] step1_getOAuthLink start', {
     url: location.href,
     hasVpsPassword: Boolean(vpsPassword),
     snapshot: getVpsPanelSnapshot(),
   });
 
-  log('步骤 1：正在等待 CPA 面板加载并进入 OAuth 页面...');
+  log(`步骤 ${logStep}：正在等待 CPA 面板加载并进入 OAuth 页面...`);
 
-  const { header, authUrlEl: existingAuthUrlEl } = await ensureOAuthManagementPage(vpsPassword, 1);
+  const { header, authUrlEl: existingAuthUrlEl } = await ensureOAuthManagementPage(vpsPassword, logStep);
   let authUrlEl = existingAuthUrlEl;
   console.log(LOG_PREFIX, '[Step 1] ensureOAuthManagementPage resolved', {
     url: location.href,
@@ -523,7 +539,7 @@ async function step1_getOAuthLink(payload) {
         url: location.href,
         buttonText: getInlineTextSnippet(getActionText(loginBtn), 80),
       });
-      log('步骤 1：OAuth 登录按钮当前不可用，正在等待授权链接出现...');
+      log(`步骤 ${logStep}：OAuth 登录按钮当前不可用，正在等待授权链接出现...`);
     } else {
       await humanPause(500, 1400);
       simulateClick(loginBtn);
@@ -531,7 +547,7 @@ async function step1_getOAuthLink(payload) {
         url: location.href,
         buttonText: getInlineTextSnippet(getActionText(loginBtn), 80),
       });
-      log('步骤 1：已点击 OAuth 登录按钮，正在等待授权链接...');
+      log(`步骤 ${logStep}：已点击 OAuth 登录按钮，正在等待授权链接...`);
     }
 
     try {
@@ -543,7 +559,7 @@ async function step1_getOAuthLink(payload) {
       );
     }
   } else {
-    log('步骤 1：CPA 面板上已显示授权链接。');
+    log(`步骤 ${logStep}：CPA 面板上已显示授权链接。`);
   }
 
   const oauthUrl = (authUrlEl.textContent || '').trim();
@@ -551,12 +567,15 @@ async function step1_getOAuthLink(payload) {
     throw new Error(`拿到的 OAuth 链接无效：\"${oauthUrl.slice(0, 50)}\"。应为 http 开头的 URL。`);
   }
 
-  log(`步骤 1：已获取 OAuth 链接：${oauthUrl.slice(0, 80)}...`, 'ok');
+  log(`步骤 ${logStep}：已获取 OAuth 链接：${oauthUrl.slice(0, 80)}...`, 'ok');
   console.log(LOG_PREFIX, '[Step 1] reporting completion with oauthUrl', {
     url: location.href,
     oauthUrlPreview: oauthUrl.slice(0, 120),
   });
-  reportComplete(1, { oauthUrl });
+  if (report) {
+    reportComplete(1, { oauthUrl });
+  }
+  return { oauthUrl };
 }
 
 // ============================================================
